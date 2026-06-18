@@ -1,60 +1,43 @@
 # FARAS Backend - Render Deployment
-# Builds dlib directly from source via git clone (bypasses pip wheel issues)
+# Uses prebuilt dlib-bin wheel instead of compiling dlib from source.
+# Render's free tier gives only 512MB RAM, which is not enough to compile
+# dlib's C++ (a single translation unit like object_detection.cpp can need
+# 1GB+ of RAM for the compiler alone, regardless of build parallelism).
+# dlib-bin ships a prebuilt manylinux wheel for the same dlib version, so
+# installing it is just unpacking a .whl - no compilation, no OOM risk.
 
 FROM python:3.11-bullseye
 
-# Install ALL build dependencies
+WORKDIR /app
+
+# Minimal runtime libs needed by opencv-python-headless / dlib-bin at
+# import time (no compilers, no -dev packages, no cmake needed anymore).
 RUN apt-get update && apt-get install -y \
-    build-essential \
-    cmake \
-    gfortran \
-    git \
-    wget \
-    libopenblas-dev \
-    liblapack-dev \
-    libatlas-base-dev \
-    libboost-python-dev \
-    libboost-thread-dev \
-    libboost-all-dev \
-    libx11-dev \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
     libxrender-dev \
-    python3-dev \
-    pkg-config \
     && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
 
 RUN pip install --upgrade pip setuptools wheel
 
-# Install numpy first
+# Install numpy first (face_recognition_models / dlib-bin expect it present)
 RUN pip install numpy==1.26.4
 
-# Build dlib from source directly (most reliable method)
-# IMPORTANT: dlib's setup.py calls CMake, which by default compiles using
-# ALL available CPU cores in parallel. Each compile job for dlib's
-# template-heavy C++ (especially the pybind11 bindings) can use 1-2GB+ RAM,
-# so on a multi-core build machine this can spike to 8GB+ and OOM-kill the
-# build. Capping parallelism keeps memory bounded (slower, but safe).
-ENV CMAKE_BUILD_PARALLEL_LEVEL=1
+# Prebuilt dlib wheel - matches the dlib version face-recognition==1.3.0
+# expects, but installs in seconds with no compilation.
+RUN pip install dlib-bin==19.24.2.post1
 
-# Pin to the same version declared in requirements.txt instead of master,
-# so the dlib you build actually matches what face-recognition expects.
-RUN git clone --depth 1 --branch v19.24.2 https://github.com/davisking/dlib.git /tmp/dlib && \
-    cd /tmp/dlib && \
-    python setup.py install && \
-    rm -rf /tmp/dlib
-
-# Install face_recognition_models
+# face_recognition_models (pure Python/data, no compilation needed)
 RUN pip install git+https://github.com/ageitgey/face_recognition_models
 
-# Install face_recognition (no dlib install, already done above)
+# face-recognition itself, without letting it pull the real "dlib" package
+# as a dependency (which would trigger a source build and undo everything
+# above). dlib-bin already provides the "dlib" importable module.
 RUN pip install face-recognition==1.3.0 --no-deps
-RUN pip install Pillow
+RUN pip install Pillow Click
 
-# Install remaining packages
+# Remaining application dependencies
 RUN pip install \
     flask==3.0.3 \
     flask-cors==4.0.1 \
