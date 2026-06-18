@@ -19,7 +19,13 @@ RUN apt-get update && apt-get install -y \
     libxrender-dev \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --upgrade pip setuptools wheel
+# setuptools>=81 removed the pkg_resources module. face_recognition_models'
+# __init__.py does "from pkg_resources import resource_filename" at import
+# time, so a too-new setuptools makes face_recognition_models *install*
+# successfully but crash on import - which is exactly what surfaced at
+# runtime ("please install face_recognition_models") even though it really
+# was installed. Pinning below 81 keeps pkg_resources available.
+RUN pip install --upgrade pip "setuptools<81" wheel
 
 # Install numpy first (face_recognition_models / dlib-bin expect it present)
 RUN pip install numpy==1.26.4
