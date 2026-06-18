@@ -33,7 +33,16 @@ RUN pip install --upgrade pip setuptools wheel
 RUN pip install numpy==1.26.4
 
 # Build dlib from source directly (most reliable method)
-RUN git clone --depth 1 https://github.com/davisking/dlib.git /tmp/dlib && \
+# IMPORTANT: dlib's setup.py calls CMake, which by default compiles using
+# ALL available CPU cores in parallel. Each compile job for dlib's
+# template-heavy C++ (especially the pybind11 bindings) can use 1-2GB+ RAM,
+# so on a multi-core build machine this can spike to 8GB+ and OOM-kill the
+# build. Capping parallelism keeps memory bounded (slower, but safe).
+ENV CMAKE_BUILD_PARALLEL_LEVEL=1
+
+# Pin to the same version declared in requirements.txt instead of master,
+# so the dlib you build actually matches what face-recognition expects.
+RUN git clone --depth 1 --branch v19.24.2 https://github.com/davisking/dlib.git /tmp/dlib && \
     cd /tmp/dlib && \
     python setup.py install && \
     rm -rf /tmp/dlib
