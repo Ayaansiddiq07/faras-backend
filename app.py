@@ -54,6 +54,11 @@ known_names      = []
 stream_thread    = None
 stream_running   = False
 
+# Tracks (name, date) pairs we've already printed an "already logged" message
+# for, so the console isn't spammed once per frame while someone lingers in
+# view. Cleared implicitly each day since the date is part of the key.
+_already_logged_notified = set()
+
 # Max buffer size to prevent memory leaks in stream parsing (5MB)
 MAX_BUFFER_SIZE  = 5 * 1024 * 1024
 
@@ -172,7 +177,10 @@ def log_attendance(name, status):
             conn.commit()
             print(f"[LOG] Attendance logged: {name} ({status}) at {time_str}")
         else:
-            print(f"[LOG] {name} already logged today.")
+            key = (name.lower(), today)
+            if key not in _already_logged_notified:
+                _already_logged_notified.add(key)
+                print(f"[LOG] {name} already logged today.")
     except Exception as e:
         print(f"[LOG] Error logging attendance for {name}: {e}")
     finally:
@@ -276,7 +284,8 @@ def recognition_loop(stream_url):
                     # A face WAS found this frame - reset the no-face streak
                     no_face_count = 0
 
-                    print(f"[STREAM] Face detected on frame #{frame_count}")
+                    if frame_count % 20 == 1:
+                        print(f"[STREAM] Face detected on frame #{frame_count}")
 
                     detected_name = "Unknown"
                     detected      = "UNKNOWN"
