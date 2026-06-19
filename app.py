@@ -183,6 +183,10 @@ def recognition_loop(stream_url):
             stream = urllib.request.urlopen(stream_url, timeout=10)
             buffer = bytes()
 
+            frame_count = 0
+            decode_fail_count = 0
+            no_face_count = 0
+
             while stream_running and threading.current_thread() == stream_thread:
                 chunk = stream.read(1024)
                 if not chunk:
@@ -194,16 +198,42 @@ def recognition_loop(stream_url):
                 if len(buffer) > MAX_BUFFER_SIZE:
                     buffer = buffer[-MAX_BUFFER_SIZE:]
 
-                start = buffer.find(b'\xff\xd8')
-                end   = buffer.find(b'\xff\xd9')
+                # Extract ALL complete frames currently sitting in the buffer,
+                # not just one - otherwise a backlog can build up and we always
+                # process a stale, possibly truncated, frame.
+                while True:
+                    start = buffer.find(b'\xff\xd8')
+                    if start == -1:
+                        break
+                    # IMPORTANT: search for the end marker only AFTER the start
+                    # marker. \xff\xd9 byte pairs can appear inside the actual
+                    # compressed image data too, not just as the real frame
+                    # boundary - searching from position 0 (the old bug) can
+                    # match one of those false positives and slice out a
+                    # corrupted/truncated frame, which is what was causing
+                    # "Corrupt JPEG data: premature end of data segment".
+                    end = buffer.find(b'\xff\xd9', start + 2)
+                    if end == -1:
+                        break  # End marker not arrived yet, wait for more chunks
 
-                if start != -1 and end != -1:
-                    jpg    = buffer[start:end+2]
-                    buffer = buffer[end+2:]
+                    jpg    = buffer[start:end + 2]
+                    buffer = buffer[end + 2:]
+
+                    # Sanity-check size before decoding - a real frame at even
+                    # modest resolution is well over a few KB. Tiny "frames"
+                    # are almost always a parsing artifact.
+                    if len(jpg) < 1000:
+                        continue
+
+                    frame_count += 1
 
                     np_arr = np.frombuffer(jpg, dtype=np.uint8)
                     frame  = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
                     if frame is None:
+                        decode_fail_count += 1
+                        if decode_fail_count % 20 == 1:
+                            print(f"[STREAM] Decode failed ({decode_fail_count} total, "
+                                  f"{frame_count} frames seen, jpg size={len(jpg)})")
                         continue
 
                     small = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
@@ -213,7 +243,13 @@ def recognition_loop(stream_url):
                     encodings = face_recognition.face_encodings(rgb, locations)
 
                     if not encodings:
+                        no_face_count += 1
+                        if no_face_count % 20 == 1:
+                            print(f"[STREAM] No face in frame ({no_face_count} total, "
+                                  f"{frame_count} frames decoded OK)")
                         continue
+
+                    print(f"[STREAM] Face detected on frame #{frame_count}")
 
                     detected_name = "Unknown"
                     detected      = "UNKNOWN"
