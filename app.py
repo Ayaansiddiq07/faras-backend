@@ -38,6 +38,13 @@ TOLERANCE        = 0.5
 ADMIN_PASSWORD   = "faras2025"          # Change this
 ESP32_STREAM_URL = ""                   # Set via /api/config endpoint
 
+# How many consecutive "no face visible" frames must pass before we revert
+# current_result back to WAITING. At ~5-10 decoded frames/sec this is
+# roughly 1-2 seconds of grace - long enough to ignore a blink or brief
+# head-turn, short enough that the status doesn't stay stuck once someone
+# actually walks away.
+NO_FACE_GRACE_FRAMES = 10
+
 # ─── State (thread-safe access via lock) ──────────────────────────
 state_lock       = threading.Lock()
 current_result   = "WAITING"
@@ -247,7 +254,27 @@ def recognition_loop(stream_url):
                         if no_face_count % 20 == 1:
                             print(f"[STREAM] No face in frame ({no_face_count} total, "
                                   f"{frame_count} frames decoded OK)")
+
+                        # BUGFIX: previously this branch just `continue`d,
+                        # which meant current_result was NEVER updated when
+                        # no face was visible - it stayed stuck on whatever
+                        # the last detection was (e.g. "KNOWN") forever,
+                        # even minutes after the person walked away.
+                        #
+                        # Use a short grace period (based on elapsed frames,
+                        # not just a single missed frame) before reverting
+                        # to WAITING, so a brief blink/head-turn doesn't
+                        # cause the NodeMCU's LED/buzzer to flicker on every
+                        # single no-face frame.
+                        if no_face_count >= NO_FACE_GRACE_FRAMES:
+                            with state_lock:
+                                if current_result != "WAITING":
+                                    current_result = "WAITING"
+                                    current_name   = ""
                         continue
+
+                    # A face WAS found this frame - reset the no-face streak
+                    no_face_count = 0
 
                     print(f"[STREAM] Face detected on frame #{frame_count}")
 
