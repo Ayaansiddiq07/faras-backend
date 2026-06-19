@@ -54,10 +54,15 @@ known_names      = []
 stream_thread    = None
 stream_running   = False
 
-# Tracks (name, date) pairs we've already printed an "already logged" message
-# for, so the console isn't spammed once per frame while someone lingers in
-# view. Cleared implicitly each day since the date is part of the key.
-_already_logged_notified = set()
+# Handle to the currently-open urllib connection to the camera. Needed so
+# /api/stream/start can force-close the *socket* of a previous run, not just
+# flip stream_running to False - the old thread can be blocked inside a
+# blocking stream.read() call, in which case stream_thread.join(timeout=3)
+# silently times out and returns while the old thread (and its open
+# connection to the camera) is still alive. Most ESP32-CAM firmware only
+# accepts one streaming client at a time, so two live connections to the
+# same camera is what produces the 503/404 burst seen from the camera.
+current_stream_handle = None
 
 # Max buffer size to prevent memory leaks in stream parsing (5MB)
 MAX_BUFFER_SIZE  = 5 * 1024 * 1024
@@ -177,17 +182,14 @@ def log_attendance(name, status):
             conn.commit()
             print(f"[LOG] Attendance logged: {name} ({status}) at {time_str}")
         else:
-            key = (name.lower(), today)
-            if key not in _already_logged_notified:
-                _already_logged_notified.add(key)
-                print(f"[LOG] {name} already logged today.")
+            print(f"[LOG] {name} already logged today.")
     except Exception as e:
         print(f"[LOG] Error logging attendance for {name}: {e}")
     finally:
         conn.close()
 
 def recognition_loop(stream_url):
-    global current_result, current_name, stream_running, stream_thread
+    global current_result, current_name, stream_running, stream_thread, current_stream_handle
 
     print(f"[STREAM] Connecting to {stream_url}")
     stream_running = True
@@ -196,6 +198,8 @@ def recognition_loop(stream_url):
         stream = None
         try:
             stream = urllib.request.urlopen(stream_url, timeout=10)
+            with state_lock:
+                current_stream_handle = stream
             buffer = bytes()
 
             frame_count = 0
@@ -284,8 +288,7 @@ def recognition_loop(stream_url):
                     # A face WAS found this frame - reset the no-face streak
                     no_face_count = 0
 
-                    if frame_count % 20 == 1:
-                        print(f"[STREAM] Face detected on frame #{frame_count}")
+                    print(f"[STREAM] Face detected on frame #{frame_count}")
 
                     detected_name = "Unknown"
                     detected      = "UNKNOWN"
@@ -323,6 +326,9 @@ def recognition_loop(stream_url):
                     stream.close()
                 except Exception:
                     pass
+            with state_lock:
+                if current_stream_handle is stream:
+                    current_stream_handle = None
 
 # ══════════════════════════════════════════════════════════════════
 # API ROUTES
@@ -515,7 +521,7 @@ def enroll_face():
 # ── Start/Stop Stream ─────────────────────────────────────────────
 @app.route("/api/stream/start", methods=["POST"])
 def start_stream():
-    global stream_thread, stream_running, ESP32_STREAM_URL
+    global stream_thread, stream_running, ESP32_STREAM_URL, current_stream_handle
     data = request.json
     if not data:
         return jsonify({"success": False, "message": "Invalid request"}), 400
@@ -527,8 +533,27 @@ def start_stream():
     # Stop existing stream thread
     ESP32_STREAM_URL = url
     stream_running   = False
+
+    # Force-close the previous connection's socket. If the old thread is
+    # blocked inside stream.read(), join(timeout=3) below can time out and
+    # return while that thread - and its open connection to the camera -
+    # is still alive. Closing the underlying socket directly unblocks the
+    # read() immediately (it raises, the thread's except/finally handles
+    # it and exits cleanly) instead of leaving two simultaneous clients
+    # connected to a camera that may only support one.
+    with state_lock:
+        old_handle = current_stream_handle
+        current_stream_handle = None
+    if old_handle:
+        try:
+            old_handle.close()
+        except Exception:
+            pass
+
     if stream_thread and stream_thread.is_alive():
         stream_thread.join(timeout=3)
+        if stream_thread.is_alive():
+            print("[STREAM] Warning: previous stream thread did not exit in time.")
 
     stream_thread = threading.Thread(
         target=recognition_loop, args=(url,), daemon=True
@@ -538,8 +563,16 @@ def start_stream():
 
 @app.route("/api/stream/stop", methods=["POST"])
 def stop_stream():
-    global stream_running
+    global stream_running, current_stream_handle
     stream_running = False
+    with state_lock:
+        old_handle = current_stream_handle
+        current_stream_handle = None
+    if old_handle:
+        try:
+            old_handle.close()
+        except Exception:
+            pass
     return jsonify({"success": True, "message": "Stream stopped."})
 
 @app.route("/api/stream/status")
